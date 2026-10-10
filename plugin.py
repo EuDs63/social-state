@@ -889,7 +889,7 @@ class Perceiver:
     def feed_group(self, session_id: str, person_id: str, name: str, text: str, ts: float) -> None:
         if not session_id or not text:
             return
-        self._buf_append(self._group_buf, session_id, {"name": name, "text": text, "ts": ts}, GROUP_BUF_SIZE)
+        self._buf_append(self._group_buf, session_id, {"pid": person_id, "name": name, "text": text, "ts": ts}, GROUP_BUF_SIZE)
         # 群回味：每条群消息都算"印象积累"，攒够条数自动开回味窗口（无需 @）
         self.feed_group_auto(session_id, person_id, name, text, ts)
         if not bool(getattr(self._cfg(), "group_conflict", True)):
@@ -985,7 +985,8 @@ class Perceiver:
 
     def _build_group_prompt(self, lines: List[str], rel_lines: Optional[List[str]] = None) -> str:
         prompt = (
-            "你是聊天机器人麦麦的\"群聊冲突感知器\"。以下是某 QQ 群最近的聊天记录：\n"
+            "你是聊天机器人麦麦的\"群聊冲突感知器\"。以下是某 QQ 群最近的聊天记录"
+            "（每行开头的 [P1]/[P2] 是说话人的编号，同一个人始终同一个编号；麦麦自己的发言没有编号）：\n"
             + "\n".join(f"- {ln}" for ln in lines)
         )
         if rel_lines:
@@ -1008,9 +1009,10 @@ class Perceiver:
             "越骂越凶、翻旧账、揪着不放、拉其他人群嘲 = 真冲突。\n"
             "3. 证据不足宁可漏判：输出 conflict=null 即可，漏判没有惩罚，误判有惩罚。\n"
             "只输出 JSON，格式：\n"
-            '{"conflict": null} 或 {"conflict": {"attacker": "攻击者昵称", "victim": "被攻击者昵称", "brief": "一句话概括"}, "confidence": 0.9}\n'
+            '{"conflict": null} 或 {"conflict": {"attacker_pid": "P1", "attacker": "攻击者昵称", "victim_pid": "P2", "victim": "被攻击者昵称", "brief": "一句话概括"}, "confidence": 0.9}\n'
             "confidence 是你对\"这是真冲突而非玩梗\"的把握（0~1），低于 0.7 的判定会被系统忽略。"
-            "attacker/victim 必须使用聊天记录里出现过的原昵称。"
+            "attacker_pid/victim_pid 必须使用聊天记录里该说话人的编号（如 P1），不要用昵称代替——"
+            "群里可能有重名；attacker/victim 只用于记录，照抄记录里的原昵称即可。"
         )
         return prompt
 
@@ -1114,7 +1116,7 @@ class Perceiver:
         if session_id not in self._groupat_announced:
             self._groupat_announced.add(session_id)
             self._log("[群回味] 自动评估已启用：session=%s，每攒 %d 条消息回味一次", session_id[:8], batch)
-        self._buf_append(self._groupat_buf, session_id, {"name": name, "text": text, "ts": ts}, GROUP_AT_BUF_SIZE)
+        self._buf_append(self._groupat_buf, session_id, {"pid": person_id, "name": name, "text": text, "ts": ts}, GROUP_AT_BUF_SIZE)
         if session_id in self._groupat_tasks and not self._groupat_tasks[session_id].done():
             opened = self._groupat_opened_at.get(session_id, 0.0)
             if len(self._groupat_buf.get(session_id) or []) >= GROUP_AT_BUF_KEEP or time.time() - opened >= AT_EVAL_FORCE_AFTER:
@@ -1136,7 +1138,7 @@ class Perceiver:
 
     def feed_bot_group_reply(self, session_id: str, text: str, ts: float) -> None:
         """麦麦在群里的回复：也进该群的回味 buffer（上下文更完整）。"""
-        self._buf_append(self._groupat_buf, session_id, {"name": "麦麦", "text": text, "ts": ts}, GROUP_AT_BUF_SIZE)
+        self._buf_append(self._groupat_buf, session_id, {"pid": "", "name": "麦麦", "text": text, "ts": ts}, GROUP_AT_BUF_SIZE)
         if session_id in self._groupat_tasks and not self._groupat_tasks[session_id].done():
             if len(self._groupat_buf.get(session_id) or []) >= GROUP_AT_BUF_KEEP:
                 task = self._groupat_tasks.pop(session_id)
@@ -1179,6 +1181,57 @@ class Perceiver:
             self._log("[感知器][群回味] 异常: %s", exc)
             self._close_at_window(session_id)
 
+    # ── 按标签认人（群昵称不唯一，禁止按昵称落账） ──
+
+    @staticmethod
+    def _tag_participants(
+        items: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, List[str]], List[str]]:
+        """给本批次每条消息打稳定标签，供 LLM 回传、再精确落回 person_id。
+
+        群昵称可重名（"小明"可能有两个），按昵称认人会把好感/心情记到另一个人头上，
+        用户观感就是"我什么都没干怎么被扣分了"。所以：说话人一律用 [P1]/[P2] 标签标识，
+        昵称只作展示；麦麦自己的发言不带标签，不参与打分。
+
+        返回 (标签→person_id, person_id→标签, 昵称→[person_id...], 带标签的文本行)。
+        """
+        tag_to_pid: Dict[str, str] = {}
+        pid_to_tag: Dict[str, str] = {}
+        name_to_pids: Dict[str, List[str]] = {}
+        lines: List[str] = []
+        for it in items:
+            pid = str(it.get("pid") or "").strip()
+            nm = str(it.get("name") or "?").strip() or "?"
+            text = str(it.get("text") or "")
+            if not pid:
+                lines.append(f"{nm}：{text}")
+                continue
+            tag = pid_to_tag.get(pid)
+            if tag is None:
+                tag = f"P{len(pid_to_tag) + 1}"
+                pid_to_tag[pid] = tag
+                tag_to_pid[tag] = pid
+            pids = name_to_pids.setdefault(nm, [])
+            if pid not in pids:
+                pids.append(pid)
+            lines.append(f"[{tag}] {nm}：{text}")
+        return tag_to_pid, pid_to_tag, name_to_pids, lines
+
+    @staticmethod
+    def _resolve_group_target(
+        raw_tag: Any, raw_name: Any, tag_to_pid: Dict[str, str], name_to_pids: Dict[str, List[str]]
+    ) -> str:
+        """把 LLM 返回的标签解析成 person_id。
+
+        只认本批次的标签；标签缺失/无效时才退回昵称，且要求该昵称在本科次里唯一
+        （重名一律放弃）。解析不出来返回空串，调用方跳过不计分。
+        """
+        tag = str(raw_tag or "").strip().strip("[]").upper()
+        if tag:
+            return tag_to_pid.get(tag) or ""
+        cands = name_to_pids.get(str(raw_name or "").strip()) or []
+        return cands[0] if len(cands) == 1 else ""
+
     async def _evaluate_group_at(self, session_id: str) -> None:
         store = self._p._store
         try:
@@ -1187,8 +1240,8 @@ class Perceiver:
             self._log("[群回味] session=%s 到点评估，取出 %d 条消息", session_id[:8], len(items))
             if not items or store is None:
                 return
-            lines = [f"{it['name']}：{it['text']}" for it in items]
-            rel_lines = self._build_group_rel_context(items)
+            tag_to_pid, pid_to_tag, name_to_pids, lines = self._tag_participants(items)
+            rel_lines = self._build_group_rel_context(items, pid_to_tag)
             prompt = self._build_group_batch_prompt(lines, rel_lines)
             raw = await self._call_llm(prompt)
             data = extract_json(raw)
@@ -1213,11 +1266,15 @@ class Perceiver:
                     continue
                 if d_aff == 0 and d_mood == 0:
                     continue
-                person = store.find_person(nm)
-                if person is None:
-                    self._log("[感知器][群回味] 印象对象匹配失败：%r（账本无此人）", nm)
+                # 只按本批次标签落到 person_id：标签无效或昵称不唯一都不猜，直接跳过不计分
+                pid = self._resolve_group_target(ev.get("pid"), nm, tag_to_pid, name_to_pids)
+                if not pid:
+                    self._log("[感知器][群回味] 定位失败，跳过不计分：pid=%r name=%r（标签不在本批，或昵称重名）",
+                              ev.get("pid"), nm)
                     continue
-                pid = person["person_id"]
+                person = store.get_person(pid)
+                if person is None:
+                    continue
                 if now - self._groupat_last.get(pid, 0.0) < interval:
                     continue  # 这个人刚被回味过，本轮跳过
                 self._groupat_last[pid] = now
@@ -1235,7 +1292,8 @@ class Perceiver:
     def _build_group_batch_prompt(self, lines: List[str], rel_lines: Optional[List[str]] = None) -> str:
         prompt = (
             "你是聊天机器人麦麦的\"社交感知器\"，在幕后更新它对一群人的印象。"
-            "以下是麦麦所在的某个 QQ 群最近的聊天记录：\n"
+            "以下是麦麦所在的某个 QQ 群最近的聊天记录"
+            "（每行开头的 [P1]/[P2] 是说话人的编号，同一个人始终同一个编号；麦麦自己的发言没有编号）：\n"
             + "\n".join(f"- {ln}" for ln in lines)
         )
         if rel_lines:
@@ -1253,41 +1311,46 @@ class Perceiver:
             "一方明显不悦、气氛冷场 = 真冒犯才扣分。\n"
             "2. affinity 是麦麦对此人好感的变化（-10~10 整数），mood 是麦麦心情变化（-25~25 整数），"
             "reason 用一句话说明。\n"
-            "3. 名字必须使用聊天记录里出现过的原昵称。\n"
+            "3. pid 必须使用聊天记录里该说话人的编号（如 P1），不要用昵称代替——"
+            "群里可能有重名，昵称定位不了人。麦麦自己的发言没有编号，不要为它输出。\n"
             "只输出 JSON，格式：\n"
-            '{"evals": [{"name": "昵称", "affinity": 2, "mood": 1, "reason": "一句话原因"}]}\n'
+            '{"evals": [{"pid": "P1", "affinity": 2, "mood": 1, "reason": "一句话原因"}]}\n'
             "没有值得更新的人就输出 {\"evals\": []}。"
         )
         return prompt
 
-    def _build_group_rel_context(self, items: List[Dict[str, Any]]) -> List[str]:
+    def _build_group_rel_context(self, items: List[Dict[str, Any]], pid_to_tag: Dict[str, str]) -> List[str]:
         """把本批消息中出现的人物关系背景整理成给 LLM 的行为锚点行。
 
         只描述账本里已有记录的人（陌生人没有信息，注水反而干扰判断）。
+        涉事者一律用本批次的 [P1]/[P2] 标签指代——按昵称查账本会张冠李戴。
         """
         store = self._p._store
         if store is None:
             return []
-        names = list(dict.fromkeys(str(it.get("name") or "").strip() for it in items))
-        names = [n for n in names if n]
-        found: Dict[str, Dict[str, Any]] = {}
-        for nm in names:
-            p = store.find_person(nm)
-            if p is not None:
-                found[nm] = p
-        if not found:
+        pids = [p for p in dict.fromkeys(str(it.get("pid") or "").strip() for it in items) if p]
+        if not pids:
             return []
+        rows = {str(r.get("person_id") or ""): r for r in store.get_persons(pids)}
         rel: List[str] = []
-        for nm, p in found.items():
-            aff = float(p.get("affinity") or 0.0)
+        for pid in pids:
+            row = rows.get(pid)
+            if row is None:
+                continue
+            tag = pid_to_tag.get(pid) or ""
+            name = str(row.get("display_name") or "?")
+            label = f"[{tag}] {name}" if tag else name
+            aff = float(row.get("affinity") or 0.0)
             tier = "朋友" if aff >= 40 else ("认识" if aff >= 20 else "陌生人")
-            rel.append(f"{nm}：麦麦对其好感 {aff:.0f}（{tier}）")
-        pid_to_name = {p["person_id"]: nm for nm, p in found.items()}
+            rel.append(f"{label}：麦麦对其好感 {aff:.0f}（{tier}）")
         for e in store.get_all_edges():
-            a = pid_to_name.get(e.get("from_person"))
-            b = pid_to_name.get(e.get("to_person"))
-            if a and b:
-                rel.append(f"{a} 与 {b} 之间存在「{e.get('kind')}」边（权重{float(e.get('weight') or 0):.1f}，已知证据：{str(e.get('evidence') or '')[:40]}）")
+            a_tag = pid_to_tag.get(str(e.get("from_person") or ""))
+            b_tag = pid_to_tag.get(str(e.get("to_person") or ""))
+            if a_tag and b_tag:
+                rel.append(
+                    f"[{a_tag}] 与 [{b_tag}] 之间存在「{e.get('kind')}」边"
+                    f"（权重{float(e.get('weight') or 0):.1f}，已知证据：{str(e.get('evidence') or '')[:40]}）"
+                )
         return rel
 
     async def _evaluate_group(self, session_id: str) -> None:
@@ -1296,9 +1359,9 @@ class Perceiver:
             items = self._buf_take(self._group_buf, session_id)
             if not items:
                 return
-            lines = [f"{it['name']}：{it['text']}" for it in items]
+            tag_to_pid, pid_to_tag, name_to_pids, lines = self._tag_participants(items)
             # 关系背景：本批消息中出现的人的好感度 + 他们之间已有的关系边
-            rel_lines = self._build_group_rel_context(items)
+            rel_lines = self._build_group_rel_context(items, pid_to_tag)
             self._log("[群评估] session=%s 攒了 %d 条消息，开始评估（背景 %d 条）", session_id[:8], len(items), len(rel_lines))
             raw = await self._call_llm(self._build_group_prompt(lines, rel_lines))
             data = extract_json(raw)
@@ -1318,14 +1381,21 @@ class Perceiver:
             attacker_name = str(conflict.get("attacker") or "").strip()
             victim_name = str(conflict.get("victim") or "").strip()
             brief = str(conflict.get("brief") or "").strip()[:100]
-            if not attacker_name or not victim_name or attacker_name == victim_name:
-                self._log("[群评估] 识别到冲突但角色名不完整（attacker=%r victim=%r）", attacker_name, victim_name)
+            # 只按本批次标签认人：昵称重名时宁可漏判，也不能把冲突记到无关的人头上
+            attacker_pid = self._resolve_group_target(
+                conflict.get("attacker_pid"), attacker_name, tag_to_pid, name_to_pids
+            )
+            victim_pid = self._resolve_group_target(
+                conflict.get("victim_pid"), victim_name, tag_to_pid, name_to_pids
+            )
+            if not attacker_pid or not victim_pid or attacker_pid == victim_pid:
+                self._log("[群评估] 识别到冲突但定位失败（attacker_pid=%r/%r victim_pid=%r/%r），跳过",
+                          conflict.get("attacker_pid"), attacker_name, conflict.get("victim_pid"), victim_name)
                 return
-            attacker = store.find_person(attacker_name)
-            victim = store.find_person(victim_name)
-            if attacker is None or victim is None or attacker["person_id"] == victim["person_id"]:
-                self._log("[群评估] 识别到冲突但账本匹配失败：attacker=%r(%s) victim=%r(%s)",
-                          attacker_name, "找到" if attacker else "未找到", victim_name, "找到" if victim else "未找到")
+            attacker = store.get_person(attacker_pid)
+            victim = store.get_person(victim_pid)
+            if attacker is None or victim is None:
+                self._log("[群评估] 识别到冲突但账本取人失败：attacker=%r victim=%r", attacker_name, victim_name)
                 return
             # 站队原则：惩罚强度随"被攻击者与麦麦的关系"缩放。
             # 陌生人之间的冲突只记关系边（图谱事实），不动麦麦对攻击者的好感——
@@ -2356,7 +2426,14 @@ class SocialStatePlugin(MaiBotPlugin):
             row = store.find_person(target)
             if row is None:
                 return f"没找到「{target}」——ta 还没和麦麦说过话，或昵称对不上（可用 QQ 号试试）"
-            return self._render_row(row)
+            # 私聊带目标查询同样受限（上架评审要求）：不能因为"换个私聊问"就把第三方账本抖出来。
+            # 操作员不受限；本人只看自己那一份，且账号脱敏、不展示线头。
+            if is_operator:
+                return self._render_row(row)
+            sender_pid = get_person_id(sender_platform, sender_uid) if sender_uid else ""
+            if sender_pid and str(row.get("person_id")) == sender_pid:
+                return self._render_row(row, group_self=True)
+            return "🔒 只能查自己的关系状态（直接发 /关系）；查别人的账本请让麦麦主人以操作员身份操作。"
 
         person_id = self._person_for_session(stream_id)
         if person_id:

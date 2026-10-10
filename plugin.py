@@ -2470,7 +2470,8 @@ class SocialStatePlugin(MaiBotPlugin):
 
         if compact:
             # 群内 top5 隐私模式：昵称 + QQ 尾号，不显示完整账号/心情/冷落/线头
-            line = f"• {name}" + (f"（···{self._mask_uid(uid)}）" if uid else "") + f"：好感 {aff:+.0f}（{affinity_label(aff)}）"
+            # _mask_uid 自己就带 ··· 前缀，这里不能再套一层，否则渲染成 ······3456
+            line = f"• {name}" + (f"（{self._mask_uid(uid)}）" if uid else "") + f"：好感 {aff:+.0f}（{affinity_label(aff)}）"
             if last_msg > 0:
                 line += f"｜发言 {fmt_duration(now - last_msg)}"
             return line

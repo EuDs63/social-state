@@ -59,6 +59,10 @@ IGNORE_MIN, IGNORE_MAX = 0.0, 100.0
 
 SUPPORTED_CONFIG_VERSION = "0.3.0"
 
+# 插件 ID，与 _manifest.json 的 id 一致。兜底数据目录必须带上它，
+# 否则写歪时会落到 data/plugins/ 下的共享目录里。
+PLUGIN_ID = "github.ZhaoCang-QWQ.social-state"
+
 # 感知器钳制（设计文档 v0.2：单次变化上限，防 LLM 打分飘）
 MAX_AFFINITY_DELTA = 10.0
 MAX_MOOD_DELTA = 25.0
@@ -1999,7 +2003,7 @@ class SocialStatePlugin(MaiBotPlugin):
         try:
             return str(self.ctx.paths.data_dir)
         except Exception:
-            return os.path.join("data", "plugins", "social_state")
+            return os.path.join("data", "plugins", PLUGIN_ID)
 
     def _enabled(self) -> bool:
         return bool(getattr(self.config.plugin, "enabled", True)) and self._store is not None
@@ -2404,7 +2408,7 @@ class SocialStatePlugin(MaiBotPlugin):
             "给每个联系人记一本账：好感度 / 今日心情 / 被冷落指数 / 待续线头 / 互动时间。\n"
             "麦麦回复时会自动参考（对喜欢的人更热情，被冷落时更克制）。\n\n"
             "命令：\n"
-            "  /关系 —— 私聊查自己；群里看最近互动 top5（隐私模式：昵称+QQ尾号）\n"
+            "  /关系 —— 私聊查自己；群里看本群最近互动 top5（隐私模式：昵称+QQ尾号）\n"
             "  /关系 <QQ号或昵称> —— 查指定的人（仅操作员，由主程序鉴权；群里想查自己的详细账本请私聊麦麦发 /关系）\n"
             "  /今天 —— 看麦麦今天的日程\n"
             "  /ss_set <QQ号> <字段> <值> —— 手动调账（仅操作员）\n"
@@ -2414,7 +2418,7 @@ class SocialStatePlugin(MaiBotPlugin):
             "说明：操作员在 bot_config.toml 的 [plugin].permission 里配 platform:user_id（如 qq:123456），\n"
             "本地控制台天然是操作员。好感/心情由感知器自动打分（LLM 语境化评估），\n"
             "也可用 /ss_set 手动校准。心情隔天自动归零，冷落指数每天缓解，线头默认 10 天有效。\n"
-            "麦麦每天有自己的日程（问\"在干嘛\"能答出正在干嘛），数据在 data/plugins/social_state/ 下。"
+            "麦麦每天有自己的日程（问\"在干嘛\"能答出正在干嘛），数据在 data/plugins/<插件ID>/ 下。"
         )
         await self.ctx.send.text(text, stream_id)
         return True, "ok", True
@@ -2440,10 +2444,12 @@ class SocialStatePlugin(MaiBotPlugin):
                 if is_self:
                     return self._render_row(row, group_self=True)
                 return "🔒 群里只能查自己的关系状态（/关系）；查别人的账本请让麦麦主人操作，或私聊麦麦。"
-            rows = store.top_persons(5)
+            # 范围必须收在本群内：person_state 是全库表、没有群维度，用全局 top 查询会把
+            # 别的群和私聊的联系人（昵称 + QQ 尾号 + 好感档位）抖进本群回复里。
+            rows = self._group_recent_persons(stream_id, limit=5)
             if not rows:
-                return "还没有任何记录——先让麦麦跟人聊几句吧"
-            lines = ["💞 最近互动的关系状态（top5，隐私模式）："]
+                return "本群最近还没有足够的互动记录——先聊几句吧"
+            lines = ["💞 本群最近互动的关系状态（top5，隐私模式）："]
             for row in rows:
                 lines.append(self._render_row(row, compact=True))
             return "\n".join(lines)
@@ -2467,14 +2473,27 @@ class SocialStatePlugin(MaiBotPlugin):
             if row is not None:
                 return self._render_row(row)
 
-        # 群里：最近互动 top5（此分支理论上不再到达，保留兼容）
-        rows = store.top_persons(5)
-        if not rows:
-            return "还没有任何记录——先让麦麦跟人聊几句吧"
-        lines = ["💞 最近互动的关系状态（top5，隐私模式）："]
-        for row in rows:
-            lines.append(self._render_row(row, compact=True))
-        return "\n".join(lines)
+        # 私聊但查不到本人记录：命令消息在 on_receive 里被 is_command 提前拦掉、不会建
+        # session 映射，所以"私聊第一句就是 /关系"、或刚重启（_person_sessions 只在主动
+        # 中枢开启时才从库恢复）都会稳定走到这里。只回一句占位，绝不退化成跨会话的
+        # 全库 top 清单——那等于把别人的关系状态给第三方看（上架评审阻断项）。
+        return "还没有你的记录——先跟麦麦聊几句，它就开始记账了"
+
+    def _group_recent_persons(self, session_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """本群近期发言者，按最后发言时间倒序。
+
+        person_state 是全库表、没有群维度，范围只能来自本会话记录的成员名单
+        （_group_sessions），否则会把手伸到别的群和私聊去。
+        """
+        store = self._store
+        if store is None:
+            return []
+        members = list(self._group_sessions.get(session_id) or [])
+        if not members:
+            return []
+        rows = store.get_persons(members)
+        rows.sort(key=lambda r: (r.get("last_msg_at") or 0), reverse=True)
+        return rows[: max(1, int(limit))]
 
     @staticmethod
     def _mask_uid(uid: str) -> str:

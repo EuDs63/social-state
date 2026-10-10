@@ -2293,17 +2293,42 @@ class SocialStatePlugin(MaiBotPlugin):
 
     # 正则要点（官方陷阱清单 §13-7）：宿主用 re.search 匹配，回复场景下命令不在文本开头，
     # `^` 锚点会失配 → 用 (?<!\S) 负向前瞻（命令前必须是行首或空白）代替 ^。
-    @Command("关系", description="查看关系状态：/关系（群内为隐私模式）或 /关系 <QQ号|昵称>（群内仅本人/操作员）", pattern=r"(?<!\S)/关系(?:\s+(?P<target>.+?))?\s*$")
+    @Command("关系", description="查看自己的关系状态：私聊=查自己，群内=最近互动 top5（隐私模式）", pattern=r"(?<!\S)/关系\s*$")
     async def cmd_relation(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any):
+        try:
+            sender_uid = str(kwargs.get("user_id") or "").strip()
+            sender_platform = str(kwargs.get("platform") or "qq")
+            in_group = bool(str(kwargs.get("group_id") or "").strip())
+            # 无目标 = 查自己/看群内 top5，查询者身份由 session 决定，不需要额外鉴权
+            text = self._render_query(stream_id, "", sender_uid=sender_uid,
+                                      sender_platform=sender_platform, in_group=in_group, is_operator=False)
+        except Exception as exc:
+            text = f"❌ 查询出错：{exc}"
+        await self.ctx.send.text(text, stream_id)
+        return True, "ok", True
+
+    # 查别人是权限敏感操作，交给主程序判定（文档 §7.2「方式一：主程序判定」）。
+    # 绝不能自己用 kwargs["is_local_operator"] 判操作员：`core/local_operator.py:17-20` 里它
+    # 只对本地控制台（bot_console）为真，QQ 上被列入 plugin.permission 的操作员永远是 False，
+    # 那样主人会被自己的插件挡在门外。permission="operator" 由宿主按 plugin.permission
+    # （platform:user_id）+ command_permissions 统一判定（`message_receive/bot.py:295`），
+    # 与 /ss_set 用的是同一条路。
+    @Command(
+        "关系查询",
+        description="按 QQ号/昵称查任意人的完整账本（仅操作员）",
+        pattern=r"(?<!\S)/关系\s+(?P<target>.+?)\s*$",
+        permission="operator",
+    )
+    async def cmd_relation_query(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any):
         try:
             groups = matched_groups or {}
             target = str(groups.get("target") or "").strip()
             sender_uid = str(kwargs.get("user_id") or "").strip()
             sender_platform = str(kwargs.get("platform") or "qq")
             in_group = bool(str(kwargs.get("group_id") or "").strip())
-            is_operator = bool(kwargs.get("is_local_operator"))
+            # 走到这里说明宿主已按操作员放行；_render_query 内仍保留兜底拒绝
             text = self._render_query(stream_id, target, sender_uid=sender_uid,
-                                      sender_platform=sender_platform, in_group=in_group, is_operator=is_operator)
+                                      sender_platform=sender_platform, in_group=in_group, is_operator=True)
         except Exception as exc:
             text = f"❌ 查询出错：{exc}"
         await self.ctx.send.text(text, stream_id)
@@ -2380,13 +2405,14 @@ class SocialStatePlugin(MaiBotPlugin):
             "麦麦回复时会自动参考（对喜欢的人更热情，被冷落时更克制）。\n\n"
             "命令：\n"
             "  /关系 —— 私聊查自己；群里看最近互动 top5（隐私模式：昵称+QQ尾号）\n"
-            "  /关系 <QQ号或昵称> —— 查指定的人（群内仅限本人或操作员）\n"
+            "  /关系 <QQ号或昵称> —— 查指定的人（仅操作员，由主程序鉴权；群里想查自己的详细账本请私聊麦麦发 /关系）\n"
             "  /今天 —— 看麦麦今天的日程\n"
             "  /ss_set <QQ号> <字段> <值> —— 手动调账（仅操作员）\n"
             "     字段：affinity 好感(-100~100)｜mood 心情(-50~50)｜ignore 冷落(0~100)｜thread 线头\n"
             "     例：/ss_set 123456 affinity 30 ；/ss_set 123456 thread 周末约了漫展\n"
             "  /关系帮助 —— 本说明\n\n"
-            "说明：好感/心情由感知器自动打分（LLM 语境化评估，每轮对话按间隔评估一次），\n"
+            "说明：操作员在 bot_config.toml 的 [plugin].permission 里配 platform:user_id（如 qq:123456），\n"
+            "本地控制台天然是操作员。好感/心情由感知器自动打分（LLM 语境化评估），\n"
             "也可用 /ss_set 手动校准。心情隔天自动归零，冷落指数每天缓解，线头默认 10 天有效。\n"
             "麦麦每天有自己的日程（问\"在干嘛\"能答出正在干嘛），数据在 data/plugins/social_state/ 下。"
         )

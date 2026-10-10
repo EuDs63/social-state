@@ -5,7 +5,11 @@
 ## v0.4.6（2026-10-10）
 
 ### 修复
+- **操作员判据用错，把主人自己挡在门外**：`cmd_relation` 原来用 `kwargs["is_local_operator"]` 判断操作员，但该值只对本地控制台（`bot_console`）为真（`core/local_operator.py:17-20`），QQ 上被列入 `plugin.permission` 的操作员永远拿到 `False`——`/关系 <别人>` 的操作员分支实际从未生效。现按官方文档 §7.2「方式一：主程序判定」拆成两条命令：`/关系`（无参，人人可用：私聊查自己 / 群内 top5）与 `/关系 <目标>`（`permission="operator"`，由宿主按 `plugin.permission` + `command_permissions` 统一鉴权，与 `/ss_set` 同一条路）；`_render_query` 内保留兜底拒绝，避免绕过命令层直接调用时泄露
 - 群内 `/关系` top5 的 QQ 尾号被重复脱敏，渲染成 `······3456`（`_mask_uid` 自带 `···` 前缀，调用处又套了一层），现为 `···3456`
+
+### 变更
+- README 新增「操作员怎么配」一节（`[plugin].permission = ["qq:123456789"]`），并说明群里想查自己的详细账本请私聊发 `/关系`
 
 ## v0.4.5（2026-10-10）
 

@@ -1401,6 +1401,9 @@ class DailyLife:
     def __init__(self, plugin: "SocialStatePlugin") -> None:
         self._p = plugin
         self._generating: set = set()  # 正在生成的日期，防重入
+        # session_id → 上一次注入给这个会话的活动文本。同一会话里"你现在在做什么"只在
+        # 第一次讲清，之后同一活动再注入会变成口头禅（麦麦老是重复自己在干嘛）。
+        self._last_act: "OrderedDict[str, str]" = OrderedDict()
 
     def _cfg(self) -> DailyLifeSectionConfig:
         return getattr(self._p.config, "daily_life", DailyLifeSectionConfig())
@@ -1438,14 +1441,21 @@ class DailyLife:
                 best = str(it.get("content") or "")
         return best
 
-    def life_block(self) -> str:
-        """组装【表达约束】+【你今天的生活】注入段；不启用/没数据时返回空串。"""
+    def life_block(self, session_id: str = "", is_new_turn: bool = True) -> str:
+        """组装【表达约束】+【你今天的生活】注入段；不启用/没数据时返回空串。
+
+        session_id 用于跨轮去重：同一会话内"你现在在做什么"只讲清楚一次，之后同一活动
+        反复注入会被模型演成口头禅（症状：麦麦老是重复自己在做什么）。
+        is_new_turn=False 表示同一次回复的重试，不消费去重状态——否则重试会被误判成新一轮
+        而给模型塞一句"你上一轮已经说过了"。
+        """
         cfg = self._cfg()
         parts: List[str] = []
         if bool(getattr(cfg, "expression_style", True)):
             parts.append(
                 "【表达约束】像真人一样说话：口语化、短句，一次只说一两句，不写书面语和小说式描写；"
-                "不确定的事不要编造，不知道就承认不知道。"
+                "不确定的事不要编造，不知道就承认不知道；同一件事不要翻来覆去说，"
+                "尤其不要反复交代自己在做什么。"
             )
         if not self._ready():
             return "\n".join(parts)
@@ -1461,12 +1471,33 @@ class DailyLife:
             return "\n".join(parts)
         night = self.night_state(hour)
         if night is not None:
-            parts.append(f"【你今天的生活】现在这个点（{hour} 点）你{night}，回复会慢、会很困。")
+            # 旧措辞"被问到在干嘛就按这个回答"等于每轮提醒模型它的活动；改成纯背景，
+            # 并显式要求别主动提——这是"重复自己在做什么"的主要来源。
+            parts.append(
+                f"【你今天的生活·背景】现在这个点（{hour} 点）你{night}。"
+                "这只是状态背景，对方问起再自然带过，不要主动提。"
+            )
             return "\n".join(parts)
         act = self.current_activity(items, hour)
         if act:
-            parts.append(f"【你今天的生活】现在这个点（{hour} 点）你大概正在：{act}。被问到\"在干嘛\"就按这个自然回答。")
+            parts.append(self._life_line(session_id, hour, act, is_new_turn))
         return "\n".join(parts)
+
+    def _life_line(self, session_id: str, hour: int, act: str, is_new_turn: bool) -> str:
+        """活动注入行：首次讲清，同一会话里重复出现时明确要求别再提。"""
+        line = (
+            f"【你今天的生活·背景】现在这个点（{hour} 点）你在：{act}。"
+            "这只是状态背景，只在对方问起你在做什么时用一两句自然带过，不要主动提起。"
+        )
+        if is_new_turn and session_id:
+            repeated = self._last_act.get(session_id) == act
+            if repeated:
+                line += "（这件事你上一轮已经跟对方说过了——这次不要再提，也别换个说法重说一遍。）"
+            self._last_act[session_id] = act
+            self._last_act.move_to_end(session_id)
+            while len(self._last_act) > MAX_PRIVATE_SESSIONS:
+                self._last_act.popitem(last=False)
+        return line
 
     def _ensure_generate(self, date: str) -> None:
         if date in self._generating:
@@ -1541,7 +1572,10 @@ class DailyLife:
                 return
             items = [it for it in raw if isinstance(it, dict)] if isinstance(raw, list) else []
             n = store.save_schedule(date, items) if store else 0
-            self._log("[生活日程] %s 日程已生成（%d 个时段）" if n else "[生活日程] %s 生成结果为空", date, n)
+            if n:
+                self._log("[生活日程] %s 日程已生成（%d 个时段）", date, n)
+            else:
+                self._log("[生活日程] %s 生成结果为空", date)
         except Exception as exc:
             self._log("[生活日程] 生成异常: %s", exc)
         finally:
@@ -1718,6 +1752,7 @@ class ProactiveHub:
         self.ctx_log("[主动中枢] 冲动过闸：向 %s 递出由头（当日第 %d 次）", name, store.count_proactive_today() + 1)
         store.add_event(person_id, "proactive", intent[:100])
         prev_reply_ts = float((store.get_person(person_id) or {}).get("last_bot_reply_at") or 0.0)
+        prev_out_ts = float(self._p._last_out_ts.get(session_id) or 0.0)
         try:
             await self._p.ctx.maisaka.trigger_proactive(
                 stream_id=session_id,
@@ -1730,9 +1765,13 @@ class ProactiveHub:
             return
         # 落锤复查：planner 模型可能"想完不落锤"（只有思考无 tool call），
         # 90 秒后确认没回复就重递一次冲动——不绕过终审，只是再敲一次门
-        asyncio.create_task(self._retry_if_silent(person_id, session_id, prev_reply_ts=prev_reply_ts, intent=intent))
+        asyncio.create_task(self._retry_if_silent(
+            person_id, session_id, prev_reply_ts=prev_reply_ts, prev_out_ts=prev_out_ts, intent=intent
+        ))
 
-    async def _retry_if_silent(self, person_id: str, session_id: str, *, prev_reply_ts: float, intent: str) -> None:
+    async def _retry_if_silent(
+        self, person_id: str, session_id: str, *, prev_reply_ts: float, prev_out_ts: float, intent: str
+    ) -> None:
         await asyncio.sleep(90)
         store = self._p._store
         if store is None or not self._running:
@@ -1741,11 +1780,16 @@ class ProactiveHub:
         if row is None:
             return
         cur_reply = float(row.get("last_bot_reply_at") or 0.0)
-        if cur_reply > prev_reply_ts:
-            self.ctx_log("[主动中枢] 复查：planner 已回复，无需重试")
+        cur_out = float(self._p._last_out_ts.get(session_id) or 0.0)
+        # 双判据：账本记录的回复时间 + 本会话真实发出过的消息时间。
+        # 只看账本时，person 映射缺失（重启后 _private_sessions 为空）会让"已经回了"
+        # 被误判成"没回"，于是重递一次冲动 → 麦麦把同一句主动问候发两遍。
+        if cur_reply > prev_reply_ts or cur_out > prev_out_ts:
+            self.ctx_log("[主动中枢] 复查：已发出回复，无需重试")
             return
         self.ctx_log("[主动中枢] 复查：90 秒内未回复，重递一次冲动")
-        store.add_event(person_id, "proactive", "retry")
+        # 重试用独立 kind：不占用当日主动额度（count_proactive_today 只数 kind='proactive'）
+        store.add_event(person_id, "proactive_retry", "retry")
         try:
             await self._p.ctx.maisaka.trigger_proactive(
                 stream_id=session_id,
@@ -1778,6 +1822,9 @@ class SocialStatePlugin(MaiBotPlugin):
         self._life = DailyLife(self)
         self._hub = ProactiveHub(self)
         self._person_sessions: Dict[str, str] = {}  # person_id → 最新私聊 session（主动触发反查用）
+        # session_id → 最近一次真的发出消息的时间（有界 LRU）：主动中枢"落锤复查"的唯一可信依据，
+        # 只认 session，不依赖 person 映射（映射缺失时账本时间不会更新）。
+        self._last_out_ts: "OrderedDict[str, float]" = OrderedDict()
         self._maint_task: Optional[asyncio.Task] = None  # 维护循环：群评估兜底等
 
     # ── 生命周期（加载器契约：三个都必须实现） ──
@@ -1859,6 +1906,7 @@ class SocialStatePlugin(MaiBotPlugin):
         self._private_sessions.clear()
         self._group_sessions.clear()
         self._person_sessions.clear()
+        self._last_out_ts.clear()
         self.ctx.logger.info("[关系状态表] 已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -1901,6 +1949,33 @@ class SocialStatePlugin(MaiBotPlugin):
                 self._store.set_person_session(person_id, session_id)  # 持久化：重启不再失忆
             except Exception:
                 pass
+
+    def _note_outbound(self, session_id: str, ts: float) -> None:
+        """记录"本会话刚真的发出过一条消息"（有界 LRU，仅供主动中枢复查）。"""
+        if not session_id:
+            return
+        self._last_out_ts[session_id] = ts
+        self._last_out_ts.move_to_end(session_id)
+        while len(self._last_out_ts) > MAX_PRIVATE_SESSIONS:
+            self._last_out_ts.popitem(last=False)
+
+    def _person_for_session(self, session_id: str) -> str:
+        """session → person 反查：先查热缓存，未命中回退持久化的 person→session 映射。
+
+        重启后 _private_sessions 是空的（它只在收到消息时才填），但 _person_sessions
+        已经按库恢复——不回退就会出现"麦麦明明回了、账本却没记 last_bot_reply_at"，
+        进而让主动中枢的落锤复查误判为"没回复"并重递冲动。
+        """
+        if not session_id:
+            return ""
+        person_id = self._private_sessions.get(session_id)
+        if person_id:
+            return person_id
+        for pid, sid in self._person_sessions.items():
+            if sid == session_id:
+                self._remember_private(session_id, pid)  # 回填热缓存，下次 O(1)
+                return pid
+        return ""
 
     def _remember_group(self, session_id: str, person_id: str) -> None:
         if not session_id:
@@ -1990,20 +2065,22 @@ class SocialStatePlugin(MaiBotPlugin):
             if not self._enabled() or sent is not True or not isinstance(message, dict):
                 return
             info = message.get("message_info") or {}
+            session_id = str(message.get("session_id") or "").strip()
+            now = time.time()
+            # 先无条件记一笔"本会话发出过消息"：这是主动中枢复查的唯一可信依据，
+            # 不依赖下面的 person 映射能不能查到（查不到也要记，否则会重递冲动发两遍）。
+            self._note_outbound(session_id, now)
             if info.get("group_info"):
                 # 群回复也喂给开着回味窗口的人（上下文更完整），但不对特定人记"我理过 ta"
-                self._perceiver.feed_bot_group_reply(
-                    str(message.get("session_id") or ""), text_from_message(message), time.time()
-                )
+                self._perceiver.feed_bot_group_reply(session_id, text_from_message(message), now)
                 return
-            session_id = str(message.get("session_id") or "").strip()
-            person_id = self._private_sessions.get(session_id)
+            person_id = self._person_for_session(session_id)
             if not person_id:
                 return
-            self._store.touch_bot_reply(person_id, time.time())
+            self._store.touch_bot_reply(person_id, now)
             self._store.add_event(person_id, "bot_reply_private")
             # 麦麦的话也进感知器 buffer（评估时上下文更完整）
-            self._perceiver.feed_bot_reply(session_id, text_from_message(message), time.time())
+            self._perceiver.feed_bot_reply(session_id, text_from_message(message), now)
         except Exception as exc:
             try:
                 self.ctx.logger.warning("[关系状态表] on_sent 异常: %s", exc)
@@ -2040,7 +2117,7 @@ class SocialStatePlugin(MaiBotPlugin):
                     block = self._build_group_block(rows[: max(1, max_n)])
 
             # 阶段3a：表达约束 + 今日生活（独立于关系块，即使没有关系数据也注入）
-            life = self._life.life_block()
+            life = self._life.life_block(session_id, is_new_turn=self._is_new_turn(kwargs))
             if life:
                 block = (block + "\n" + life) if block else life
 
@@ -2056,6 +2133,18 @@ class SocialStatePlugin(MaiBotPlugin):
             except Exception:
                 pass
             return {"action": "continue", "modified_kwargs": dict(kwargs)}
+
+    @staticmethod
+    def _is_new_turn(kwargs: Dict[str, Any]) -> bool:
+        """本轮是不是一次新的回复（而不是同一次回复的重试）。
+
+        宿主在 `maisaka.replyer.before_request` 上带 `attempt`（从 1 开始，重试递增）；
+        只有新一轮才消费"这句话已经说过了"的去重状态。
+        """
+        try:
+            return int(kwargs.get("attempt") or 1) <= 1
+        except Exception:
+            return True
 
     # ── 注入文本 ──
 
@@ -2269,7 +2358,7 @@ class SocialStatePlugin(MaiBotPlugin):
                 return f"没找到「{target}」——ta 还没和麦麦说过话，或昵称对不上（可用 QQ 号试试）"
             return self._render_row(row)
 
-        person_id = self._private_sessions.get(stream_id)
+        person_id = self._person_for_session(stream_id)
         if person_id:
             row = store.get_person(person_id)
             if row is not None:
